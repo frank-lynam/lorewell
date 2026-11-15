@@ -1,4 +1,4 @@
-"""hobkin-lore build and review: documentation (HTML, a tool's --help) through a model into a pack source whose
+"""lorewell build and review: documentation (HTML, a tool's --help) through a model into a pack source whose
 entries cite the source lines they rest on, flagged when they don't; rebuilds ask the model nothing new and keep
 a reviewer's decisions; the review page reads and writes the pack source."""
 
@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import hobkin_lore as hl  # noqa: E402
+import lorewell as hl  # noqa: E402
 from fake_model import FakeModel  # noqa: E402
 
 DOC = """<html><body><nav>skip me</nav>

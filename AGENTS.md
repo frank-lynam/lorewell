@@ -1,10 +1,10 @@
-# Working on hobkin-lore
+# Working on lorewell
 
 - **Setting it up at a site** (not changing the code): follow `docs/RUNBOOK.md`.
-- **Finding your way:** `grep -n '^# ----' hobkin_lore.py` lists its sections (format, compile, lookup, notes,
+- **Finding your way:** `grep -n '^# ----' lorewell.py` lists its sections (format, compile, lookup, notes,
   install, build, review, workspace, mcp, command line); the map near the top says what each holds. Keep the
   map in step.
-- **One file, standard library only:** `hobkin_lore.py`, Python 3.9+ (no `match`, no `X | Y` outside
+- **One file, standard library only:** `lorewell.py`, Python 3.9+ (no `match`, no `X | Y` outside
   annotations, no f-string quote nesting from 3.12). The same file is copied into every installed skill as
   `lore.py`, so the lookup side must never need anything but the standard library and the lore beside it.
   The build pipeline calls a model over HTTP with urllib, as hobkin does; no SDKs.
@@ -32,5 +32,8 @@
   when it's installed; `tests/fake_model.py` stands in for a model, `tests/fakeps.py` for a PeopleSoft-style
   CLI over a fake database). No test needs the network or a real model. Add a test for every behaviour you
   change.
-- GitHub: `frank-lynam/hobkin-lore` (remote `origin` uses the `github-hobkin-lore` SSH alias). Commit and push
-  finished work.
+- **Not hobkin-dependent, but designed for it.** An installed lore is a standard skill folder any skill-reading
+  agent uses; `install` goes to the agent that's here (hobkin first, then Claude Code) unless told. Nothing in a
+  lore or the lookup side may need hobkin.
+- GitHub: `frank-lynam/lorewell` (remote `origin` uses the `github-lorewell` SSH alias). Commit and push
+  finished work. PyPI name `lorewell`: don't publish without asking.

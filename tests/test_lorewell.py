@@ -1,4 +1,4 @@
-"""hobkin-lore: compile a pack source, look things up the way an agent does, keep notes, and install the skill
+"""lorewell: compile a pack source, look things up the way an agent does, keep notes, and install the skill
 folder that hobkin and Claude Code read. Standard library only: python3 -m unittest discover tests"""
 
 import json
@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-import hobkin_lore as hl  # noqa: E402
+import lorewell as hl  # noqa: E402
 
 JQ = ROOT / "packs" / "jq"
 
@@ -24,7 +24,7 @@ def run(*args, lore=None, cwd=None, script=None):
     env.pop("LORE", None)
     if lore:
         env["LORE"] = str(lore)
-    r = subprocess.run([sys.executable, str(script or ROOT / "hobkin_lore.py"), *args], capture_output=True,
+    r = subprocess.run([sys.executable, str(script or ROOT / "lorewell.py"), *args], capture_output=True,
                        text=True, env=env, cwd=cwd)
     return r.returncode, r.stdout + r.stderr
 
@@ -170,17 +170,46 @@ class LoreTest(unittest.TestCase):
         home = Path.home()
         self.assertEqual(hl.install_dir(ns(claude=True)), home / ".claude" / "skills")
         self.assertEqual(hl.install_dir(ns(project="/p")), Path("/p/.claude/skills"))
-        os.environ["HOBKIN_HOME"] = str(self.tmp / "hh")
+        self.assertEqual(hl.install_dir(ns(to="/x")), Path("/x"))
+
+    def test_install_default_is_the_agent_thats_here(self):
+        """No destination: hobkin's shared skills if hobkin is here (lorewell is designed for it), else Claude
+        Code's, else it asks where."""
+        ns = lambda **k: type("A", (), {"to": None, "claude": False, "project": None, "hobkin": False, **k})  # noqa
+        home = self.tmp / "home"
+        home.mkdir()
+        saved = {k: os.environ.get(k) for k in ("HOME", "HOBKIN_HOME")}
+        os.environ["HOME"] = str(home)
+        os.environ.pop("HOBKIN_HOME", None)
         try:
-            self.assertEqual(hl.install_dir(ns()), self.tmp / "hh" / "_shared" / "skills")
+            with self.assertRaises(hl.LoreError) as e:
+                hl.install_dir(ns())
+            self.assertIn("--to DIR", str(e.exception))
+            (home / ".claude").mkdir()
+            self.assertEqual(hl.install_dir(ns()), home / ".claude" / "skills")
+            (home / ".hobkins").mkdir()
+            self.assertEqual(hl.install_dir(ns()), home / ".hobkins" / "_shared" / "skills")
+            os.environ["HOBKIN_HOME"] = str(self.tmp / "hh")
+            self.assertEqual(hl.install_dir(ns(hobkin=True)), self.tmp / "hh" / "_shared" / "skills")
         finally:
-            del os.environ["HOBKIN_HOME"]
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_note_by(self):
+        """A note says who made it: --by, else the hobkin's id, else the user."""
+        lore = hl.Lore(self.lore)
+        args = type("A", (), {"text": ["kept", "this"], "on": None, "by": "tess"})
+        hl.cmd_note(lore, args)
+        self.assertTrue(any("tess" in str(r) for r in lore.notes.all()), lore.notes.all())
 
     # --- mcp
     def mcp(self, *messages, args=()):
-        """Talk to `hobkin-lore mcp` over stdio: the replies, by id."""
+        """Talk to `lorewell mcp` over stdio: the replies, by id."""
         lines = "".join(json.dumps({"jsonrpc": "2.0", **m}) + "\n" for m in messages)
-        r = subprocess.run([sys.executable, str(ROOT / "hobkin_lore.py"), "mcp", *(args or [str(self.lore)])],
+        r = subprocess.run([sys.executable, str(ROOT / "lorewell.py"), "mcp", *(args or [str(self.lore)])],
                            input=lines, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = [json.loads(l) for l in r.stdout.splitlines()]          # stdout holds nothing but JSON-RPC

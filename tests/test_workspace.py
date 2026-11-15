@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-import hobkin_lore as hl  # noqa: E402
+import lorewell as hl  # noqa: E402
 
 FAKEPS = Path(__file__).resolve().parent / "fakeps.py"
 OPS = {
@@ -35,7 +35,7 @@ OPS = {
 
 
 def run(*args, cwd, env=None):
-    r = subprocess.run([sys.executable, str(ROOT / "hobkin_lore.py"), *args], capture_output=True, text=True,
+    r = subprocess.run([sys.executable, str(ROOT / "lorewell.py"), *args], capture_output=True, text=True,
                        cwd=cwd, env={**os.environ, **(env or {})})
     return r.returncode, r.stdout + r.stderr
 

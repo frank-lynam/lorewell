@@ -1,12 +1,13 @@
-# hobkin-lore
+# lorewell
 
 Reference packs ("lores") for programming languages and their tools, that an AI agent looks things up in
 instead of holding them in context. A whole language reference, every function, class and keyword, worked
 examples, and the documentation of its command-line tools: far more than fits in a context window, searchable
 in a few hundred tokens a lookup.
 
-A lore is one SQLite file. Installed, it's a skill folder that both
-[hobkin](https://github.com/frank-lynam/hobkin) and [Claude Code](https://code.claude.com) read as it is:
+A lore is one SQLite file. Installed, it's a standard skill folder that any agent which reads skills can use.
+It's designed for [hobkin](https://github.com/frank-lynam/hobkin), and
+[Claude Code](https://code.claude.com) reads it as it is. Other tools reach it as an MCP server (below):
 
 ```text
 jq-lore/
@@ -24,12 +25,13 @@ or an agent) from documentation and command-line tools to installed skills and a
 ## Use a lore
 
 ```sh
-pip install hobkin-lore
-hobkin-lore compile packs/jq                  # a pack source (below) into jq.lore.db
-hobkin-lore install jq.lore.db                # as a skill for every hobkin (~/.hobkins/_shared/skills/)
-hobkin-lore install jq.lore.db --claude       # for Claude Code (~/.claude/skills/)
-hobkin-lore install jq.lore.db --project .    # for one project's Claude Code (.claude/skills/)
-hobkin-lore install jq.lore.db --to DIR       # any skills folder
+pip install lorewell
+lorewell compile packs/jq                  # a pack source (below) into jq.lore.db
+lorewell install jq.lore.db                # for the agent that's here: hobkin's shared skills, else Claude Code's
+lorewell install jq.lore.db --hobkin       # for every hobkin (~/.hobkins/_shared/skills/)
+lorewell install jq.lore.db --claude       # for Claude Code (~/.claude/skills/)
+lorewell install jq.lore.db --project .    # for one project's Claude Code (.claude/skills/)
+lorewell install jq.lore.db --to DIR       # any skills folder
 ```
 
 For VS Code's Copilot, Cursor or Claude Desktop, see [MCP](#in-vs-code-cursor-claude-desktop-and-other-mcp-clients) below.
@@ -72,7 +74,7 @@ installed skill's own `lore.py` serves it, so the editor needs nothing installed
 
 ```sh
 python3 ~/.claude/skills/jq-lore/lore.py mcp          # its own lore
-hobkin-lore mcp jq.lore.db peoplecode.lore.db          # several: each tool then takes `lore`
+lorewell mcp jq.lore.db peoplecode.lore.db          # several: each tool then takes `lore`
 ```
 
 VS Code (`.vscode/mcp.json` in a workspace, or **MCP: Open User Configuration**):
@@ -125,7 +127,7 @@ one is a hand-written starter from general PeopleSoft knowledge (the TargetConte
 URLs, `RECORD_FIELD$row` ids, waiting out server round trips, toolbar and message-box ids that start with `#`),
 whose examples run against a small imitation of PIA's structure in its `files/` (they pass where Playwright and
 Chromium are installed, and are unchecked elsewhere). Ids and behaviour vary by PeopleTools version: verify on
-your pages, note what differs, and extend it with your team's own test scripts (`hobkin-lore build` into the same
+your pages, note what differs, and extend it with your team's own test scripts (`lorewell build` into the same
 folder keeps everything written by hand).
 
 **Checked examples.** With `check` in `pack.json`, `compile` runs every example through the language's own
@@ -146,15 +148,15 @@ with "rebuild it": lores are built artifacts, rebuilt from their source, never c
 ## Build a lore from any documentation
 
 Hand-writing a pack is fine for a small language; a real one (PeopleCode, a vendor's DSL) has thousands of
-pages. `hobkin-lore build` has a model write the pack source from the documentation itself:
+pages. `lorewell build` has a model write the pack source from the documentation itself:
 
 ```sh
 export LORE_API_KEY=...            # any OpenAI-format endpoint: OpenRouter, a gateway, Ollama, vLLM...
-hobkin-lore build jq https://jqlang.org/manual/v1.7/ --tool jq --version 1.7 \
+lorewell build jq https://jqlang.org/manual/v1.7/ --tool jq --version 1.7 \
     --check 'jq -c -f {file}' --check-ext .jq --check-compare json \
     --base-url https://openrouter.ai/api/v1 --model nvidia/nemotron-3-ultra-550b-a55b
-hobkin-lore review packs/jq          # check what it made, in the browser
-hobkin-lore compile packs/jq         # then compile and install as usual
+lorewell review packs/jq          # check what it made, in the browser
+lorewell compile packs/jq         # then compile and install as usual
 ```
 
 1. **Gather.** PDFs (with `pdftotext`), HTML (files, folders or URLs; navigation and scripts dropped,
@@ -190,7 +192,7 @@ sections, 178 symbols and 280 examples (252 of them run as documented) in 23 chu
 
 ## Review
 
-`hobkin-lore review packs/NAME` serves a page on `127.0.0.1:8765` (local only, and changes need a token
+`lorewell review packs/NAME` serves a page on `127.0.0.1:8765` (local only, and changes need a token
 embedded in the page). Each entry is shown beside the source lines it cites, its quote highlighted; flagged
 and unreviewed entries come first. Accept, reject, or edit and save: the pack source's JSONL is updated in
 place, and `compile` leaves rejected entries out. Examples can be run through the pack's check command, and
@@ -255,6 +257,6 @@ python3 -m unittest discover -v tests
 ## Releasing
 
 Releases go to PyPI from GitHub Actions with Trusted Publishing (no token stored), the same way as hobkin:
-bump `__version__` in `hobkin_lore.py`, commit and push, then publish a GitHub release tagged `vX.Y.Z` to match.
+bump `__version__` in `lorewell.py`, commit and push, then publish a GitHub release tagged `vX.Y.Z` to match.
 The workflow tests on Python 3.9, 3.12 and 3.14, checks the tag, builds and uploads. Running it by hand
 (Actions → Publish → Run workflow) goes to TestPyPI instead.

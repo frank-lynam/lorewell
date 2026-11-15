@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""hobkin-lore: reference packs ("lores") for languages and their tools, that an agent looks things up in
+"""lorewell: reference packs ("lores") for languages and their tools, that an agent looks things up in
 instead of holding them in context. One stdlib-only file; a lore is one SQLite file.
 
 A lore holds a language's reference (sections, every function/class/keyword as a symbol, examples) and its
 tools' documentation (what each command-line tool is for, its flags, real runs), searchable with SQLite's
-full-text search. Installed, it's a skill folder that hobkin and Claude Code both read: SKILL.md, this file
+full-text search. Installed, it's a skill folder any agent that reads skills can use (designed for hobkin;
+Claude Code reads it as it is): SKILL.md, this file
 (as lore.py, the lookup tool) and the .lore.db.
 
 Making a lore:
-    hobkin-lore compile SRC [-o NAME.lore.db]   compile a pack source (a folder: pack.json, sections.jsonl,
+    lorewell compile SRC [-o NAME.lore.db]   compile a pack source (a folder: pack.json, sections.jsonl,
                                                 symbols.jsonl, tools.jsonl, examples.jsonl, cheatsheet.md,
                                                 skill.md) into a lore; examples are run through the pack's
                                                 check command when it has one (--no-check to skip)
-    hobkin-lore install LORE [--hobkin | --claude | --project DIR | --to DIR]
-                                                a skill folder for it: hobkin's shared skills (the default),
-                                                ~/.claude/skills, DIR/.claude/skills, or any folder
+    lorewell install LORE [--hobkin | --claude | --project DIR | --to DIR]
+                                                a skill folder for it: by default for the agent that's here
+                                                (hobkin's shared skills, else ~/.claude/skills); or as asked
 
-Looking things up (an agent runs these, as `python3 lore.py ...` in the skill folder, or `hobkin-lore ...`
+Looking things up (an agent runs these, as `python3 lore.py ...` in the skill folder, or `lorewell ...`
 with --lore FILE or $LORE):
     info                    what this lore covers, and its counts
     cheatsheet              the short always-useful page
@@ -31,24 +32,24 @@ with --lore FILE or $LORE):
     notes [QUERY]           what's been noted
 
 Building a pack source from documentation (with any OpenAI-format model), and reviewing it:
-    hobkin-lore build NAME [DOCS...] [--tool CMD]... --base-url URL --model M [--check CMD]
+    lorewell build NAME [DOCS...] [--tool CMD]... --base-url URL --model M [--check CMD]
                                                 PDF, HTML, Markdown, folders, URLs, tools' --help and man
                                                 pages -> packs/NAME, every entry citing the source lines it
                                                 rests on; model answers recorded, so rebuilds are cheap
-    hobkin-lore review DIR                      a local page: each entry beside its source; accept, edit, reject
+    lorewell review DIR                      a local page: each entry beside its source; accept, edit, reject
 
 Code that lives in a database (a lore whose tools can pull and deploy it), worked from a git repo:
-    hobkin-lore ws init LORE | list | pull | status [--remote] | deploy FILE... | validate | compile | test
+    lorewell ws init LORE | list | pull | status [--remote] | deploy FILE... | validate | compile | test
 
 Serving lores to any MCP client (VS Code, Cursor, Claude Desktop...), over stdio:
-    hobkin-lore mcp [LORE...]                   (in an installed skill: python3 lore.py mcp)
+    lorewell mcp [LORE...]                   (in an installed skill: python3 lore.py mcp)
 
 Standard library only; Python 3.9+. See README.md for the pack source format.
 """
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 import argparse
 import base64
@@ -72,12 +73,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ---- map: `grep -n '^# ----' hobkin_lore.py` lists these sections.
+# ---- map: `grep -n '^# ----' lorewell.py` lists these sections.
 #   format        the lore's schema, the pack source files, reading and checking them
 #   compile       pack source -> .lore.db (running the examples through the pack's check command)
 #   lookup        the commands an agent uses: info, cheatsheet, toc, search, symbol, show, examples, tools, tool
 #   notes         what agents learn, in a notes file beside the lore (never inside it)
-#   install       the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
+#   install       the skill folder any skill-reading agent uses: SKILL.md, lore.py, the lore
 #   build         any documentation -> a pack source, with a model: gather, chunk, distill, verify, finish
 #   review        a local web page to review a built pack source, entry by entry, beside the source it cites
 #   workspace     code that lives in a database, in a git repo: pull, status, deploy (conflict-checked), validate
@@ -216,7 +217,7 @@ def read_source(src: Path) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", pack["name"]):
         raise LoreError("pack.json name: lowercase letters, digits and hyphens (it names the skill)")
     kept = lambda rows: [r for r in rows if (r.get("review") or {}).get("status") != "rejected"]  # noqa: E731
-    p = {"pack": pack,       # what a reviewer rejected (hobkin-lore review) stays in the source, out of the lore
+    p = {"pack": pack,       # what a reviewer rejected (lorewell review) stays in the source, out of the lore
          "sections": kept(read_jsonl(src / "sections.jsonl")), "symbols": kept(read_jsonl(src / "symbols.jsonl")),
          "tools": kept(read_jsonl(src / "tools.jsonl")), "examples": kept(read_jsonl(src / "examples.jsonl")),
          "cheatsheet": (src / "cheatsheet.md").read_text(encoding="utf-8") if (src / "cheatsheet.md").exists() else "",
@@ -356,7 +357,7 @@ def compile_pack(src: Path, out: Path, check: bool = True, log=print) -> dict:
             "files": json.dumps([{"path": f["path"], "exec": f["exec"],
                                   "data": base64.b64encode(f["data"]).decode()} for f in p["files"]])
             if p["files"] else "",
-            "built_by": f"hobkin-lore {__version__}"}
+            "built_by": f"lorewell {__version__}"}
     con.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
     for i, s in enumerate(p["sections"]):
         con.execute("INSERT INTO sections VALUES (?,?,?,?,?,?)",
@@ -702,7 +703,7 @@ def cmd_note(lore: Lore, args) -> str:
     text = " ".join(args.text).strip()
     if not text:
         raise LoreError("note what? (note TEXT [--on SYMBOL|SECTION|TOOL])")
-    n = lore.notes.add(text, args.on, os.environ.get("HOBKIN_ID") or os.environ.get("USER"))
+    n = lore.notes.add(text, args.on, getattr(args, "by", None) or os.environ.get("HOBKIN_ID") or os.environ.get("USER"))
     return f"noted (#{n}{' on ' + args.on if args.on else ''}); it shows up in search, and on {args.on or 'notes'}"
 
 
@@ -715,7 +716,7 @@ def cmd_notes(lore: Lore, args) -> str:
                      for i, at, by, ref, t in rows) or "no notes yet"
 
 
-# ---- install: the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
+# ---- install: the skill folder any skill-reading agent uses (hobkin, Claude Code): SKILL.md, lore.py, the lore
 
 def lore_files(meta: dict) -> list[dict]:
     return [{"path": f["path"], "exec": f.get("exec", False), "data": base64.b64decode(f["data"])}
@@ -736,7 +737,8 @@ def file_note(f: dict) -> str:
 
 
 def skill_md(meta: dict, has_tools: bool, has_examples: bool) -> str:
-    """SKILL.md in the format hobkin and Claude Code both read: name and description in front matter, then the
+    """SKILL.md in the standard skill format (hobkin and Claude Code both read it): name and description in front
+    matter, then the
     instructions. The description says when to use it, since that's all an agent sees before opening it."""
     name, title = f"{meta['name']}-lore", meta["title"]
     desc = (f"The {title} reference: look up {meta['language']} syntax, functions and keywords"
@@ -812,14 +814,25 @@ def skill_md(meta: dict, has_tools: bool, has_examples: bool) -> str:
     return "\n".join(lines)
 
 
+HOBKIN_SKILLS = lambda: Path(os.environ.get("HOBKIN_HOME", "~/.hobkins")).expanduser() / "_shared" / "skills"
+CLAUDE_SKILLS = lambda: Path("~/.claude/skills").expanduser()
+
+
 def install_dir(args) -> Path:
+    """Where the skill goes: as asked, else the agent that's on this box (hobkin, which lorewell is designed for,
+    then Claude Code), else ask for a folder."""
     if args.to:
         return Path(args.to).expanduser()
     if args.claude:
-        return Path("~/.claude/skills").expanduser()
+        return CLAUDE_SKILLS()
     if args.project:
         return Path(args.project).expanduser() / ".claude" / "skills"
-    return Path(os.environ.get("HOBKIN_HOME", "~/.hobkins")).expanduser() / "_shared" / "skills"
+    if args.hobkin or HOBKIN_SKILLS().parent.parent.is_dir():
+        return HOBKIN_SKILLS()
+    if CLAUDE_SKILLS().parent.is_dir():
+        return CLAUDE_SKILLS()
+    raise LoreError("no agent's skills folder here (hobkin's ~/.hobkins, Claude Code's ~/.claude): "
+                    "say where with --to DIR (or --hobkin, --claude, --project DIR)")
 
 
 def install(lore_path: Path, base: Path) -> Path:
@@ -1030,7 +1043,7 @@ def gather(sources: list[str], tools: list[str], work: Path, log=print, model: M
 
     for src in sources:
         if re.match(r"https?://", src):
-            req = urllib.request.Request(src, headers={"User-Agent": f"hobkin-lore/{__version__}"})
+            req = urllib.request.Request(src, headers={"User-Agent": f"lorewell/{__version__}"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
             keep(src, "html" if "<html" in raw[:2000].lower() else "text",
@@ -2163,7 +2176,7 @@ def mcp_serve(lores: dict[str, Lore], stdin=None, stdout=None) -> None:
             send({"id": mid, "result": {
                 "protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": f"{first['name']}-lore" if len(lores) == 1 else "hobkin-lore",
+                "serverInfo": {"name": f"{first['name']}-lore" if len(lores) == 1 else "lorewell",
                                "title": f"{title} reference", "version": __version__},
                 "instructions": (f"A searchable reference for {title}. Before writing or fixing code in it, read "
                                  "cheatsheet once, then look up each function, keyword or tool you aren't certain "
@@ -2191,19 +2204,19 @@ LOOKUPS = {"info": cmd_info, "cheatsheet": cmd_cheatsheet, "toc": cmd_toc, "sear
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="hobkin-lore" if Path(sys.argv[0]).name != "lore.py" else "lore.py",
+    ap = argparse.ArgumentParser(prog="lorewell" if Path(sys.argv[0]).name != "lore.py" else "lore.py",
                                  description="Reference packs (lores) for languages and their tools.")
-    ap.add_argument("--version", action="version", version=f"hobkin-lore {__version__}")
+    ap.add_argument("--version", action="version", version=f"lorewell {__version__}")
     ap.add_argument("--lore", help="the .lore.db to read (default: $LORE, or the one beside lore.py)")
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("compile", help="compile a pack source folder into a lore")
     c.add_argument("src")
     c.add_argument("-o", "--out", help="where to write it (default: NAME.lore.db here)")
     c.add_argument("--no-check", action="store_true", help="don't run the examples through the check command")
-    i = sub.add_parser("install", help="install a lore as a skill (hobkin's shared skills by default)")
+    i = sub.add_parser("install", help="install a lore as a skill (by default for the agent that's here)")
     i.add_argument("lore_file", metavar="LORE")
     where = i.add_mutually_exclusive_group()
-    where.add_argument("--hobkin", action="store_true", help="~/.hobkins/_shared/skills (the default)")
+    where.add_argument("--hobkin", action="store_true", help="~/.hobkins/_shared/skills (for every hobkin here)")
     where.add_argument("--claude", action="store_true", help="~/.claude/skills (Claude Code, for you)")
     where.add_argument("--project", metavar="DIR", help="DIR/.claude/skills (Claude Code, for one project)")
     where.add_argument("--to", metavar="DIR", help="any skills folder")
@@ -2292,6 +2305,7 @@ def parser() -> argparse.ArgumentParser:
     n = sub.add_parser("note", help="keep something learned the hard way")
     n.add_argument("text", nargs="+")
     n.add_argument("--on", help="the symbol, section or tool it's about")
+    n.add_argument("--by", help="who's noting it (default: the hobkin, else the user)")
     ns = sub.add_parser("notes", help="what's been noted")
     ns.add_argument("query", nargs="*")
     return ap
@@ -2382,7 +2396,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{r['out']}: {r['sources']} sources, {r['chunks']} chunks -> {r['sections']} sections, "
                   f"{r['symbols']} symbols, {r['examples']} examples, {r['tools']} tools; {r['flagged']} flagged "
                   f"for review; {r['model_calls']} model calls (the rest were recorded)"
-                  f"\n  next: hobkin-lore review {r['out']}   then: hobkin-lore compile {r['out']}")
+                  f"\n  next: lorewell review {r['out']}   then: lorewell compile {r['out']}")
             return 0
         if args.cmd == "review":
             srv = review_server(Path(args.src), args.host, args.port)

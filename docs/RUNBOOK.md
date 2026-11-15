@@ -1,6 +1,6 @@
-# hobkin-lore runbook: from documentation and tools to a working PeopleSoft workspace
+# lorewell runbook: from documentation and tools to a working PeopleSoft workspace
 
-This is a step-by-step procedure for an AI agent (or a person) setting hobkin-lore up at a site. Follow the
+This is a step-by-step procedure for an AI agent (or a person) setting lorewell up at a site. Follow the
 steps in order. Each step says what to run, what success looks like, and when to stop and ask a person.
 Commands are for a Linux shell with Python 3.9 or newer.
 
@@ -26,16 +26,16 @@ Words used here:
 ## Step 0: install and check
 
 ```sh
-pip install hobkin-lore            # or: pip install --user hobkin-lore
-hobkin-lore --version              # success: hobkin-lore 0.2.0 (or newer)
+pip install lorewell            # or: pip install --user lorewell
+lorewell --version              # success: lorewell 0.2.0 (or newer)
 ```
 
 Check it works offline with the sample that ships in the source package:
 
 ```sh
-pip download --no-deps --no-binary :all: hobkin-lore -d /tmp/hl && tar xzf /tmp/hl/hobkin_lore-*.tar.gz -C /tmp/hl
-hobkin-lore compile /tmp/hl/hobkin_lore-*/packs/jq --no-check -o /tmp/hl/jq.lore.db
-hobkin-lore --lore /tmp/hl/jq.lore.db symbol map
+pip download --no-deps --no-binary :all: lorewell -d /tmp/hl && tar xzf /tmp/hl/lorewell-*.tar.gz -C /tmp/hl
+lorewell compile /tmp/hl/lorewell-*/packs/jq --no-check -o /tmp/hl/jq.lore.db
+lorewell --lore /tmp/hl/jq.lore.db symbol map
 ```
 
 Success: `compile` prints `9 sections, 40 symbols, 1 tools, 12 examples` and `symbol map` prints `map(f)` and a
@@ -61,7 +61,7 @@ Gather the PeopleCode documentation (PeopleBooks: the PeopleCode Language Refere
 PeopleCode Developer's Guide) as HTML folders or PDFs, in one folder, for example `~/docs/peoplebooks/`.
 
 ```sh
-hobkin-lore build peoplecode ~/docs/peoplebooks/ --title PeopleCode --version "8.60" --out packs/peoplecode --jobs 4
+lorewell build peoplecode ~/docs/peoplebooks/ --title PeopleCode --version "8.60" --out packs/peoplecode --jobs 4
 ```
 
 Use the PeopleTools version the documentation is for. A big documentation set takes a while (each chunk is
@@ -79,7 +79,7 @@ as `.log` or `.transcript`) in a folder, for example `~/docs/ps-scripts/`. **Rem
 first.**
 
 ```sh
-hobkin-lore build pstools ~/docs/ps-scripts/ --tool "THE-CLI-COMMAND" --tool "psdmtx" --tool "sqlplus" \
+lorewell build pstools ~/docs/ps-scripts/ --tool "THE-CLI-COMMAND" --tool "psdmtx" --tool "sqlplus" \
     --title "PeopleSoft tools" --out packs/pstools --help-limit 120
 ```
 
@@ -96,7 +96,7 @@ runs (`THE-CLI-COMMAND -help`), and stop and ask if it doesn't.
 ## Step 4: review (a person does this, with you)
 
 ```sh
-hobkin-lore review packs/pstools          # then open http://127.0.0.1:8765/ in a browser
+lorewell review packs/pstools          # then open http://127.0.0.1:8765/ in a browser
 ```
 
 The page lists every entry beside the source text it came from. **Flagged** entries (their quote wasn't
@@ -118,10 +118,10 @@ at minimum, review all flagged entries and the operations.
 ## Step 5: compile and install
 
 ```sh
-hobkin-lore compile packs/peoplecode
-hobkin-lore compile packs/pstools --no-check
-hobkin-lore install peoplecode.lore.db --claude      # ~/.claude/skills/peoplecode-lore/
-hobkin-lore install pstools.lore.db --claude         # ~/.claude/skills/pstools-lore/
+lorewell compile packs/peoplecode
+lorewell compile packs/pstools --no-check
+lorewell install peoplecode.lore.db --claude      # ~/.claude/skills/peoplecode-lore/
+lorewell install pstools.lore.db --claude         # ~/.claude/skills/pstools-lore/
 ```
 
 Success: each `compile` prints its counts; each `install` prints `installed: ...`. If `compile` lists
@@ -182,14 +182,14 @@ skills are installed.
 
 ## Step 8 (optional): testing PeopleSoft pages with Playwright
 
-hobkin-lore comes with a starter lore for writing Playwright (Python) tests of PeopleSoft pages: how pages are
+lorewell comes with a starter lore for writing Playwright (Python) tests of PeopleSoft pages: how pages are
 framed, which ids to use, how to wait for the server. It's in the source package.
 
 ```sh
-pip download --no-deps --no-binary :all: hobkin-lore -d /tmp/hl && tar xzf /tmp/hl/hobkin_lore-*.tar.gz -C /tmp/hl
-cp -r /tmp/hl/hobkin_lore-*/packs/peoplesoft-pia packs/peoplesoft-pia      # keep it with the other packs
-hobkin-lore compile packs/peoplesoft-pia
-hobkin-lore install peoplesoft-pia.lore.db --claude
+pip download --no-deps --no-binary :all: lorewell -d /tmp/hl && tar xzf /tmp/hl/lorewell-*.tar.gz -C /tmp/hl
+cp -r /tmp/hl/lorewell-*/packs/peoplesoft-pia packs/peoplesoft-pia      # keep it with the other packs
+lorewell compile packs/peoplesoft-pia
+lorewell install peoplesoft-pia.lore.db --claude
 ```
 
 Success: `compile` prints `8 examples` with `8 pass` (when Playwright for Python and Chromium are installed)
@@ -202,7 +202,7 @@ Then make it match this site:
    toolbar ids, the message box. Where this site differs, `lore.py note "what it really is" --on ENTRY`
    (it shows up in every later lookup), or fix the entry in `packs/peoplesoft-pia/` and compile again.
 2. If the team has existing Playwright (or Selenium) tests of PeopleSoft pages, add them:
-   `hobkin-lore build peoplesoft-pia ~/repos/ps-tests/ --out packs/peoplesoft-pia`. The build adds what it
+   `lorewell build peoplesoft-pia ~/repos/ps-tests/ --out packs/peoplesoft-pia`. The build adds what it
    learns from them; everything already in the pack (written by hand or reviewed) is kept as it is. Then
    review (Step 4) and compile.
 3. Tests run against a development or test environment, never production (Rule 1), with credentials from
