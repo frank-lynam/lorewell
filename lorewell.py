@@ -778,7 +778,10 @@ class Living:
     def _con(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.path, timeout=30)
-        con.executescript(LIVING_SCHEMA)
+        # The schema once, not on every call: CREATE ... IF NOT EXISTS is still a write (a lock and a disk sync), and
+        # reads shouldn't queue behind other writers for it
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'topics'").fetchone():
+            con.executescript(LIVING_SCHEMA)
         return con
 
     @staticmethod
