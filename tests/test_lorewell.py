@@ -331,5 +331,70 @@ class LoreTest(unittest.TestCase):
         self.assertIn("fixture/content.html", files)
 
 
+
+class LivingTest(unittest.TestCase):
+    """A living lore: written as agents learn, updated in place with a history, aliases, quiet recall, merge."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.lv = hl.Living(self.tmp / "field.lore.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_topic_written_again_is_updated_and_the_old_one_kept(self):
+        self.assertEqual(self.lv.remember("Repo/Mono Repo/Build", "Bazel; CI runs the full suite.", "bodkin"), "added")
+        self.assertEqual(self.lv.remember("repo/mono-repo/build", "Bazel 7; CI runs the full suite.", "dabkin"),
+                         "updated")
+        self.assertEqual(self.lv.remember("repo/mono-repo/build", "Bazel 7; CI runs the full suite."), "unchanged")
+        self.assertEqual(self.lv.get("repo/mono-repo/build")["by"], "dabkin")
+        self.assertEqual([h["body"] for h in self.lv.history("repo/mono-repo/build")], ["Bazel; CI runs the full suite."])
+        self.assertTrue(self.lv.forget("repo/mono-repo/build", "frank", "wrong repo"))
+        self.assertIsNone(self.lv.get("repo/mono-repo/build"))
+        self.assertEqual(len(self.lv.history("repo/mono-repo/build")), 2)
+        self.assertEqual(self.lv.search("bazel"), [])
+
+    def test_secrets_never_get_in(self):
+        self.lv.remember("env/prod", "Deploys use token=hunter2xyz and key AKIAABCDEFGHIJKLMNOP via https://u:pw@h/x")
+        body = self.lv.get("env/prod")["body"]
+        for secret in ("hunter2xyz", "AKIAABCDEFGHIJKLMNOP", "u:pw@"):
+            self.assertNotIn(secret, body)
+
+    def test_aliases_join_names(self):
+        self.lv.remember("people/frank/preferences", "Frank wants minimal testing; CI catches regressions.")
+        self.lv.alias("flynam", "frank")
+        self.lv.alias("Linium F", "frank")
+        self.assertEqual(self.lv.names_of("flynam"), ["frank", "flynam", "linium f"])
+        self.assertEqual([h["topic"] for h in self.lv.search("flynam")], ["people/frank/preferences"])
+        self.assertEqual([h["topic"] for h in self.lv.search("linium f")], ["people/frank/preferences"])
+
+    def test_recall_is_quiet_unless_it_matters(self):
+        self.lv.remember("repo/mono-repo/build", "Build with bazel; the full suite takes 20 minutes in CI.")
+        self.lv.remember("people/frank/preferences", "Frank wants minimal testing.")
+        self.lv.alias("linium f", "frank")
+        self.assertEqual(self.lv.recall("yeah do it"), [])
+        self.assertEqual(self.lv.recall("ok sounds good, go")[:1], [])
+        self.assertEqual([r["topic"] for r in self.lv.recall("how do I build the mono repo?")],
+                         ["repo/mono-repo/build"])
+        self.assertEqual([r["topic"] for r in self.lv.recall("ask linium f how much testing he wants")],
+                         ["people/frank/preferences"])
+        self.assertEqual(self.lv.recall("how do I build the mono repo?", skip={"repo/mono-repo/build"}), [])
+
+    def test_merge_another_machines_lore(self):
+        other = hl.Living(self.tmp / "other.lore.db")
+        self.lv.remember("env/prod", "Prod is us-gov-west-1.")
+        other.remember("user/preferences", "Short answers.")
+        other.alias("flynam", "frank")
+        c = self.lv.merge(other.backup(self.tmp / "copy.lore.db"))
+        self.assertEqual((c["added"], c["aliases"]), (1, 1))
+        self.assertEqual({t["topic"] for t in self.lv.topics()}, {"env/prod", "user/preferences"})
+
+    def test_the_command_line(self):
+        db = str(self.tmp / "cli.lore.db")
+        self.assertEqual(run("living", db, "remember", "env/ci", "GitHub", "Actions", "on", "push")[0], 0)
+        code, out = run("living", db, "search", "actions")
+        self.assertEqual(code, 0)
+        self.assertIn("env/ci", out)
+
 if __name__ == "__main__":
     unittest.main()

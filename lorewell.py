@@ -49,7 +49,7 @@ Standard library only; Python 3.9+. See README.md for the pack source format.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import argparse
 import base64
@@ -71,6 +71,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 
 # ---- map: `grep -n '^# ----' lorewell.py` lists these sections.
@@ -78,6 +79,7 @@ from pathlib import Path
 #   compile       pack source -> .lore.db (running the examples through the pack's check command)
 #   lookup        the commands an agent uses: info, cheatsheet, toc, search, symbol, show, examples, tools, tool
 #   notes         what agents learn, in a notes file beside the lore (never inside it)
+#   living        a lore agents write as they learn: topics updated in place, history, aliases, recall, merge
 #   install       the skill folder any skill-reading agent uses: SKILL.md, lore.py, the lore
 #   build         any documentation -> a pack source, with a model: gather, chunk, distill, verify, finish
 #   review        a local web page to review a built pack source, entry by entry, beside the source it cites
@@ -714,6 +716,345 @@ def cmd_notes(lore: Lore, args) -> str:
         rows = [r for r in rows if all(w in f"{r[3] or ''} {r[4]}".lower() for w in words)]
     return "\n".join(f"#{i} {at}{' ' + by if by else ''}{' on ' + ref if ref else ''}: {t}"
                      for i, at, by, ref, t in rows) or "no notes yet"
+
+
+# ---- living: a lore that agents write as they learn (topics updated in place, history, aliases, recall, merge)
+
+LIVING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS living_meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS topics (topic TEXT PRIMARY KEY, body TEXT NOT NULL, by TEXT, at TEXT, source TEXT,
+                                   checked TEXT);
+CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, topic TEXT NOT NULL, body TEXT, by TEXT, at TEXT,
+                                    source TEXT, gone_at TEXT, gone_by TEXT, why TEXT);
+CREATE TABLE IF NOT EXISTS aliases (alias TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts USING fts5(topic, body, tokenize = "unicode61 tokenchars '_@$'");
+"""
+# Never written to a living lore, whoever writes: keys, tokens, passwords, credentials in URLs, long secret-looking blobs
+REDACT = [
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "<redacted key>"),
+    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "<redacted>"),                                 # AWS access key ids
+    (r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}", "<redacted>"),                              # API keys (sk-...)
+    (r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}", "<redacted>"),
+    (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "<redacted>"),                                 # Slack tokens
+    (r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}", "<redacted>"),                          # JWTs
+    (r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}", r"\1 <redacted>"),                     # Authorization: Bearer ...
+    (r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
+     r"aws_secret_access_key|authorization)([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;]+", r"\1\2<redacted>"),
+    (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
+    (r"(?<![\w/+=])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),          # long base64: keys, tokens
+]
+_REDACT = [(re.compile(p, re.S), r) for p, r in REDACT]
+STOPWORDS = set("""a an and are as at be but by can could did do does doing for from had has have how i if in into is
+it its just let like me my no not now of on or our out please so some than that the their them then there these they
+this to too up us was we were what when where which who why will with would yes yeah you your ok okay go do done sure
+thing things get got make made want need really also any all one two""".split())
+
+
+def redact(text: str) -> str:
+    for p, r in _REDACT:
+        text = p.sub(r, text)
+    return text
+
+
+def topic_name(topic: str) -> str:
+    """A topic's canonical name: lower case, words joined with -, parts with / (`Repo/Mono Repo/Build` ->
+    `repo/mono-repo/build`)."""
+    parts = [re.sub(r"[^a-z0-9._@-]+", "-", p.strip().lower()).strip("-") for p in topic.split("/")]
+    name = "/".join(p for p in parts if p)
+    if not name:
+        raise LoreError(f"not a topic name: {topic!r} (e.g. user/preferences, repo/NAME/build)")
+    return name
+
+
+class Living:
+    """A living lore: one SQLite file of topics that agents add to and correct as they learn. A topic written again
+    is updated, not duplicated; the version it replaces goes to the history (nothing is lost, and a bad edit is
+    easy to undo). Aliases join names that mean the same one (a board name and a login name). Every write goes
+    through `redact`. Safe for several writers at once (SQLite's locking; one topic per statement)."""
+
+    def __init__(self, path):
+        self.path = Path(path).expanduser()
+
+    def _con(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(self.path, timeout=30)
+        con.executescript(LIVING_SCHEMA)
+        return con
+
+    @staticmethod
+    def _now() -> str:
+        return time.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _index(con, topic: str, body: str | None) -> None:
+        con.execute("DELETE FROM topics_fts WHERE topic = ?", (topic,))
+        if body is not None:
+            con.execute("INSERT INTO topics_fts (topic, body) VALUES (?, ?)", (topic, body))
+
+    def remember(self, topic: str, body: str, by: str | None = None, source: str | None = None,
+                 why: str | None = None) -> str:
+        """Add a topic, or update it (the old version to the history). Returns "added", "updated" or "unchanged"."""
+        topic, body = topic_name(topic), redact(body.strip())
+        if not body:
+            raise LoreError(f"remember what about {topic}? (to remove a topic: forget)")
+        now = self._now()
+        with closing(self._con()) as con, con:
+            old = con.execute("SELECT body, by, at, source FROM topics WHERE topic = ?", (topic,)).fetchone()
+            if old and old[0] == body:
+                con.execute("UPDATE topics SET checked = ? WHERE topic = ?", (now, topic))
+                return "unchanged"
+            if old:
+                con.execute("INSERT INTO history (topic, body, by, at, source, gone_at, gone_by, why) "
+                            "VALUES (?,?,?,?,?,?,?,?)", (topic, *old, now, by, why))
+            con.execute("INSERT OR REPLACE INTO topics (topic, body, by, at, source, checked) VALUES (?,?,?,?,?,?)",
+                        (topic, body, by, now, source, now))
+            self._index(con, topic, body)
+        return "updated" if old else "added"
+
+    def forget(self, topic: str, by: str | None = None, why: str | None = None) -> bool:
+        topic = topic_name(topic)
+        with closing(self._con()) as con, con:
+            old = con.execute("SELECT body, by, at, source FROM topics WHERE topic = ?", (topic,)).fetchone()
+            if not old:
+                return False
+            con.execute("INSERT INTO history (topic, body, by, at, source, gone_at, gone_by, why) "
+                        "VALUES (?,?,?,?,?,?,?,?)", (topic, *old, self._now(), by, why or "forgotten"))
+            con.execute("DELETE FROM topics WHERE topic = ?", (topic,))
+            self._index(con, topic, None)
+        return True
+
+    def checked(self, topic: str) -> None:
+        """Mark a topic as checked (still true) now."""
+        with closing(self._con()) as con, con:
+            con.execute("UPDATE topics SET checked = ? WHERE topic = ?", (self._now(), topic_name(topic)))
+
+    def get(self, topic: str) -> dict | None:
+        with closing(self._con()) as con:
+            row = con.execute("SELECT topic, body, by, at, source, checked FROM topics WHERE topic = ?",
+                              (topic_name(topic),)).fetchone()
+        return dict(zip(("topic", "body", "by", "at", "source", "checked"), row)) if row else None
+
+    def topics(self, prefix: str = "") -> list[dict]:
+        p = topic_name(prefix) if prefix.strip("/ ") else ""
+        with closing(self._con()) as con:
+            rows = con.execute("SELECT topic, body, by, at, checked FROM topics WHERE topic = ? OR topic LIKE ? "
+                               "ORDER BY topic", (p, (p + "/%") if p else "%")).fetchall()
+        return [dict(zip(("topic", "body", "by", "at", "checked"), r)) for r in rows]
+
+    def history(self, topic: str) -> list[dict]:
+        with closing(self._con()) as con:
+            rows = con.execute("SELECT body, by, at, gone_at, gone_by, why FROM history WHERE topic = ? ORDER BY id",
+                               (topic_name(topic),)).fetchall()
+        return [dict(zip(("body", "by", "at", "gone_at", "gone_by", "why"), r)) for r in rows]
+
+    def stale(self, days: float) -> list[dict]:
+        """Topics not checked (or written) in `days` days."""
+        cut = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - days * 86400))
+        return [t for t in self.topics() if (t["checked"] or t["at"] or "") < cut]
+
+    # --- aliases: names that mean the same one (a person's board name, login name, full name)
+    def alias(self, alias: str, name: str) -> None:
+        """`alias` means `name` (both kept lower case; `name` is the canonical one)."""
+        a, n = alias.strip().lower(), self.resolve(name)
+        if not a or not n or a == n:
+            return
+        with closing(self._con()) as con, con:
+            con.execute("INSERT OR REPLACE INTO aliases (alias, name) VALUES (?, ?)", (a, n))
+            con.execute("UPDATE aliases SET name = ? WHERE name = ?", (n, a))     # what pointed at alias follows
+
+    def resolve(self, name: str) -> str:
+        n = name.strip().lower()
+        with closing(self._con()) as con:
+            row = con.execute("SELECT name FROM aliases WHERE alias = ?", (n,)).fetchone()
+        return row[0] if row else n
+
+    def names_of(self, name: str) -> list[str]:
+        """A name and every alias of it, the canonical one first."""
+        n = self.resolve(name)
+        with closing(self._con()) as con:
+            rows = con.execute("SELECT alias FROM aliases WHERE name = ? ORDER BY alias", (n,)).fetchall()
+        return [n] + [r[0] for r in rows]
+
+    def aliases(self) -> dict[str, list[str]]:
+        with closing(self._con()) as con:
+            rows = con.execute("SELECT name, alias FROM aliases ORDER BY name, alias").fetchall()
+        out: dict[str, list[str]] = {}
+        for n, a in rows:
+            out.setdefault(n, []).append(a)
+        return out
+
+    # --- finding things
+    @staticmethod
+    def _term(x: str) -> str:
+        """One word as a prefix match, or a several-word name as a phrase."""
+        ws = re.findall(r"[\w@$]+", x)
+        return f'"{ws[0]}"*' if len(ws) == 1 else '"' + " ".join(ws) + '"'
+
+    def _query(self, words: list[str], op: str) -> str:
+        """An FTS5 query: each word with its aliases as one group (looking up Frank also finds what's filed under
+        flynam), the groups joined with AND or OR."""
+        groups = []
+        for w in words:
+            alts = [self._term(x) for x in self.names_of(w) if re.search(r"[\w@$]", x)]
+            if alts:
+                groups.append(alts[0] if len(alts) == 1 else "(" + " OR ".join(alts) + ")")
+        return f" {op} ".join(groups)
+
+    def _phrases(self, text: str) -> tuple[list[str], str]:
+        """Several-word aliases in `text` ("linium f"), as their canonical names, and the text without them."""
+        t, found = " " + " ".join(re.findall(r"[\w@$]+", text.lower())) + " ", []
+        for n, al in self.aliases().items():
+            for a in sorted(al, key=len, reverse=True):
+                if " " in a and f" {a} " in t:
+                    found.append(n)
+                    t = t.replace(f" {a} ", " ")
+        return found, t
+
+    def search(self, query: str, n: int = 10) -> list[dict]:
+        """Ranked topics for `query` (every word first; any word if that finds nothing), aliases included."""
+        names, rest = self._phrases(query)
+        words = list(dict.fromkeys(names + re.findall(r"[\w@$]+", rest)))
+        hits = []
+        with closing(self._con()) as con:
+            for op in ("AND", "OR"):
+                q = self._query(words, op)
+                if not q:
+                    break
+                hits = con.execute("SELECT topic, snippet(topics_fts, 1, '[', ']', ' ... ', 16) FROM topics_fts "
+                                   "WHERE topics_fts MATCH ? ORDER BY bm25(topics_fts, 4.0, 1.0) LIMIT ?",
+                                   (q, n)).fetchall()
+                if hits:
+                    break
+        return [{"topic": t, "snippet": " ".join(s.split())} for t, s in hits]
+
+    def recall(self, text: str, n: int = 3, skip=(), min_words: int = 2) -> list[dict]:
+        """What's worth bringing up unasked, for a message: topics sharing at least `min_words` of its meaningful
+        words (one in the topic's own name counts twice), best first, leaving out those in `skip`. Meant to be
+        quiet: nothing that only shares a word or two of chatter."""
+        words = [w for w in dict.fromkeys(re.findall(r"[a-z0-9_@$][\w@$.-]*[a-z0-9_$]|[a-z0-9]", text.lower()))
+                 if len(w) > 2 and w not in STOPWORDS]
+        names, _ = self._phrases(text)
+        words = list(dict.fromkeys(names + words))
+        if not words:
+            return []
+        groups = [self.names_of(w) for w in words]       # a name and its aliases count as one word
+        q = self._query(words, "OR")
+        with closing(self._con()) as con:
+            cands = con.execute("SELECT topic, body FROM topics_fts WHERE topics_fts MATCH ? "
+                                "ORDER BY bm25(topics_fts, 4.0, 1.0) LIMIT 30", (q,)).fetchall() if q else []
+        scored = []
+        for topic, body in cands:
+            if topic in skip:
+                continue
+            tname, btext = " " + " ".join(re.findall(r"[\w@$]+", topic.lower())) + " ", " " + " ".join(
+                re.findall(r"[\w@$]+", body.lower())) + " "
+            score = sum(2 if any(f" {x} " in tname for x in g) else 1 if any(f" {x}" in btext for x in g) else 0
+                        for g in groups)
+            if score >= min_words:
+                scored.append((score, topic, body))
+        scored.sort(key=lambda s: -s[0])
+        return [{"topic": t, "body": b, "score": s} for s, t, b in scored[:n]]
+
+    # --- moving: a consistent copy, and merging another living lore in
+    def backup(self, dest) -> Path:
+        """A consistent copy (SQLite's backup, safe while others write) at `dest`."""
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._con()) as src, closing(sqlite3.connect(dest)) as out:
+            src.backup(out)
+        return dest
+
+    def merge(self, other) -> dict:
+        """Bring another living lore in (one from another machine): topics only it has are added; for a topic both
+        have, the newer wins and the other goes to the history; its history and aliases are added. Nothing is lost."""
+        theirs = Living(other)
+        counts = {"added": 0, "updated": 0, "kept": 0, "history": 0, "aliases": 0}
+        with closing(theirs._con()) as oc:
+            topics = oc.execute("SELECT topic, body, by, at, source, checked FROM topics").fetchall()
+            hist = oc.execute("SELECT topic, body, by, at, source, gone_at, gone_by, why FROM history").fetchall()
+            als = oc.execute("SELECT alias, name FROM aliases").fetchall()
+        now = self._now()
+        with closing(self._con()) as con, con:
+            for topic, body, by, at, source, checked in topics:
+                mine = con.execute("SELECT body, by, at, source, checked FROM topics WHERE topic = ?",
+                                   (topic,)).fetchone()
+                if mine and mine[0] == body:
+                    newest = max(mine[4] or "", checked or "")
+                    con.execute("UPDATE topics SET checked = ? WHERE topic = ?", (newest, topic))
+                    continue
+                if not mine:
+                    con.execute("INSERT INTO topics (topic, body, by, at, source, checked) VALUES (?,?,?,?,?,?)",
+                                (topic, redact(body), by, at, source, checked))
+                    self._index(con, topic, body)
+                    counts["added"] += 1
+                elif (at or "") > (mine[2] or ""):
+                    con.execute("INSERT INTO history (topic, body, by, at, source, gone_at, gone_by, why) "
+                                "VALUES (?,?,?,?,?,?,?,?)", (topic, *mine[:4], now, "merge", "a newer one merged in"))
+                    con.execute("INSERT OR REPLACE INTO topics (topic, body, by, at, source, checked) "
+                                "VALUES (?,?,?,?,?,?)", (topic, redact(body), by, at, source, checked))
+                    self._index(con, topic, body)
+                    counts["updated"] += 1
+                else:
+                    con.execute("INSERT INTO history (topic, body, by, at, source, gone_at, gone_by, why) "
+                                "VALUES (?,?,?,?,?,?,?,?)", (topic, body, by, at, source, now, "merge",
+                                                             "an older one, merged in"))
+                    counts["kept"] += 1
+            for row in hist:
+                if not con.execute("SELECT 1 FROM history WHERE topic = ? AND body IS ? AND at IS ? AND gone_at IS ?",
+                                   (row[0], row[1], row[3], row[5])).fetchone():
+                    con.execute("INSERT INTO history (topic, body, by, at, source, gone_at, gone_by, why) "
+                                "VALUES (?,?,?,?,?,?,?,?)", row)
+                    counts["history"] += 1
+            for a, n in als:
+                if not con.execute("SELECT 1 FROM aliases WHERE alias = ?", (a,)).fetchone():
+                    con.execute("INSERT INTO aliases (alias, name) VALUES (?, ?)", (a, n))
+                    counts["aliases"] += 1
+        return counts
+
+
+def cmd_living(args) -> str:
+    """lorewell living PATH ...: read and write a living lore from the command line."""
+    lv, a = Living(args.path), args
+    if a.lcmd == "topics":
+        rows = lv.topics(a.prefix or "")
+        return "\n".join(f"{t['topic']}  ({t['at']}, {t['by'] or '?'})  {clip_line(t['body'])}" for t in rows) \
+            or "no topics yet"
+    if a.lcmd == "topic":
+        t = lv.get(a.topic)
+        if not t:
+            return f"no topic {topic_name(a.topic)}" + (f". Close: {', '.join(x['topic'] for x in lv.search(a.topic, 3))}"
+                                                       if lv.search(a.topic, 3) else "")
+        return (f"{t['topic']}\n(by {t['by'] or '?'}, {t['at']}; checked {t['checked']}"
+                f"{'; from ' + t['source'] if t['source'] else ''})\n\n{t['body']}")
+    if a.lcmd == "search":
+        hits = lv.search(" ".join(a.query), a.n)
+        return "\n".join(f"{h['topic']}\n    {h['snippet']}" for h in hits) or f"nothing for {' '.join(a.query)!r}"
+    if a.lcmd == "remember":
+        return f"{lv.remember(a.topic, ' '.join(a.text), a.by or os.environ.get('HOBKIN_ID') or os.environ.get('USER'), a.source, a.why)}: {topic_name(a.topic)}"
+    if a.lcmd == "forget":
+        return f"forgot {topic_name(a.topic)} (it's in the history)" if lv.forget(a.topic, a.by or os.environ.get("USER"), a.why) \
+            else f"no topic {topic_name(a.topic)}"
+    if a.lcmd == "history":
+        rows = lv.history(a.topic)
+        return "\n\n".join(f"{r['at']} by {r['by'] or '?'} (replaced {r['gone_at']} by {r['gone_by'] or '?'}"
+                           f"{': ' + r['why'] if r['why'] else ''})\n{r['body']}" for r in rows) or "no history"
+    if a.lcmd == "alias":
+        if a.alias and a.name:
+            lv.alias(a.alias, a.name)
+            return f"{a.alias.lower()} -> {lv.resolve(a.name)}: {', '.join(lv.names_of(a.name))}"
+        return "\n".join(f"{n}: {', '.join(al)}" for n, al in lv.aliases().items()) or "no aliases yet"
+    if a.lcmd == "stale":
+        rows = lv.stale(a.days)
+        return "\n".join(f"{t['topic']}  (checked {t['checked'] or t['at']})" for t in rows) or "nothing stale"
+    if a.lcmd == "merge":
+        c = lv.merge(a.other)
+        return ", ".join(f"{v} {k}" for k, v in c.items())
+    raise LoreError("living PATH topics|topic|search|remember|forget|history|alias|stale|merge")
+
+
+def clip_line(text: str, n: int = 90) -> str:
+    one = " ".join(text.split())
+    return one if len(one) <= n else one[:n - 3] + "..."
 
 
 # ---- install: the skill folder any skill-reading agent uses (hobkin, Claude Code): SKILL.md, lore.py, the lore
@@ -2308,6 +2649,31 @@ def parser() -> argparse.ArgumentParser:
     n.add_argument("--by", help="who's noting it (default: the hobkin, else the user)")
     ns = sub.add_parser("notes", help="what's been noted")
     ns.add_argument("query", nargs="*")
+    lv = sub.add_parser("living", help="a living lore (agents write it as they learn): topics, search, remember, ...")
+    lv.add_argument("path", help="the living lore's file (created when first written)")
+    lsub = lv.add_subparsers(dest="lcmd", required=True)
+    x = lsub.add_parser("topics", help="every topic, or those under a prefix")
+    x.add_argument("prefix", nargs="?")
+    x = lsub.add_parser("topic", help="one topic in full")
+    x.add_argument("topic")
+    x = lsub.add_parser("search", help="ranked topics (names' aliases included)")
+    x.add_argument("query", nargs="+")
+    x.add_argument("-n", type=int, default=10)
+    x = lsub.add_parser("remember", help="add a topic, or update it (the old version goes to the history)")
+    x.add_argument("topic")
+    x.add_argument("text", nargs="+")
+    x.add_argument("--by"); x.add_argument("--source"); x.add_argument("--why")
+    x = lsub.add_parser("forget", help="remove a topic (it stays in the history)")
+    x.add_argument("topic")
+    x.add_argument("--by"); x.add_argument("--why")
+    x = lsub.add_parser("history", help="a topic's earlier versions")
+    x.add_argument("topic")
+    x = lsub.add_parser("alias", help="ALIAS NAME: ALIAS means NAME (a board name and a login); alone: every alias")
+    x.add_argument("alias", nargs="?"); x.add_argument("name", nargs="?")
+    x = lsub.add_parser("stale", help="topics not checked in DAYS days")
+    x.add_argument("days", type=float, nargs="?", default=90)
+    x = lsub.add_parser("merge", help="bring another living lore in (newest wins, nothing lost)")
+    x.add_argument("other")
     return ap
 
 
@@ -2417,6 +2783,9 @@ def main(argv: list[str] | None = None) -> int:
                     raise LoreError(f"two lores named {lo.meta['name']!r}")
                 lores[lo.meta["name"]] = lo
             mcp_serve(lores)
+            return 0
+        if args.cmd == "living":
+            print(cmd_living(args))
             return 0
         if args.cmd in LOOKUPS:
             print(LOOKUPS[args.cmd](Lore(find_lore(args.lore)), args))

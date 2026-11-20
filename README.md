@@ -248,6 +248,37 @@ lore.py ws deploy src/PeopleCode/JOB.EMPLID.FieldChange.pcode --compile
 - **The skill knows:** a lore with operations adds a section to its `SKILL.md` saying how to pull, validate and
   deploy, and to bring a conflict to a person rather than force it.
 
+## Living lores: what agents learn, kept as they go
+
+A built lore is reference: read-only, rebuilt from its source. A **living lore** is the other kind: a file of
+topics that agents (and people) write as they learn, and correct when they learn better. hobkin keeps one per
+machine, its **field lore** (`~/.hobkins/_shared/field.lore.db`), for what its hobkins know about their people,
+code bases, build systems and environments.
+
+```
+lorewell living FILE remember repo/monorepo/build "Bazel; CI runs the full suite on every push (about 20 min)."
+lorewell living FILE search build suite      # ranked topics
+lorewell living FILE topic repo/monorepo/build
+lorewell living FILE topics repo/            # every topic, or those under a prefix
+lorewell living FILE history repo/monorepo/build
+lorewell living FILE forget repo/oldthing --why "the repo's gone"
+lorewell living FILE alias flynam frank      # flynam means frank: looking up one finds the other
+lorewell living FILE stale 90                # not checked in 90 days
+lorewell living FILE merge OTHER_FILE        # another machine's: newest wins, nothing lost
+```
+
+- **Topics, not notes.** A topic is a name (`people/frank/preferences`, `repo/NAME/architecture`, `env/prod`) and
+  what's known about it. Writing a topic again updates it; the version it replaces goes to the history, so nothing
+  is lost and a bad edit is easy to undo.
+- **Secrets never get in.** Every write goes through a redaction floor (keys, tokens, passwords, credentials in URLs,
+  long secret-looking blobs), whoever writes it.
+- **Aliases** join names that mean the same one: a person's board name, login and full name. A search for any of
+  them finds what's filed under the others.
+- **Recall** (`Living.recall(text)`, what hobkin uses) is the quiet search: only topics that share at least two of a
+  message's meaningful words come back, so chatter like "yeah do it" brings up nothing.
+- From Python: `lorewell.Living(path)` with `remember`, `forget`, `get`, `topics`, `search`, `recall`, `history`,
+  `alias`, `names_of`, `stale`, `backup` (a consistent copy, safe while others write) and `merge`.
+
 ## Tests
 
 ```sh
