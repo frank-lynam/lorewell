@@ -738,8 +738,8 @@ REDACT = [
     (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "<redacted>"),                                 # Slack tokens
     (r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}", "<redacted>"),                          # JWTs
     (r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}", r"\1 <redacted>"),                     # Authorization: Bearer ...
-    (r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
-     r"aws_secret_access_key|authorization)([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;]+", r"\1\2<redacted>"),
+    (r"(?i)(\b[\w.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
+     r"aws_secret_access_key|authorization))([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;]+", r"\1\2<redacted>"),
     (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
     (r"(?<![\w/+=])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),          # long base64: keys, tokens
 ]

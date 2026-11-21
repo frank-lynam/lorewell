@@ -355,9 +355,10 @@ class LivingTest(unittest.TestCase):
         self.assertEqual(self.lv.search("bazel"), [])
 
     def test_secrets_never_get_in(self):
-        self.lv.remember("env/prod", "Deploys use token=hunter2xyz and key AKIAABCDEFGHIJKLMNOP via https://u:pw@h/x")
+        self.lv.remember("env/prod", "Deploys use token=hunter2xyz and key AKIAABCDEFGHIJKLMNOP via https://u:pw@h/x"
+                                     " with db_password=dbpw42")
         body = self.lv.get("env/prod")["body"]
-        for secret in ("hunter2xyz", "AKIAABCDEFGHIJKLMNOP", "u:pw@"):
+        for secret in ("hunter2xyz", "AKIAABCDEFGHIJKLMNOP", "u:pw@", "dbpw42"):
             self.assertNotIn(secret, body)
 
     def test_aliases_join_names(self):
