@@ -741,7 +741,8 @@ REDACT = [
     (r"(?i)(\b[\w.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
      r"aws_secret_access_key|authorization))([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;]+", r"\1\2<redacted>"),
     (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
-    (r"(?<![\w/+=])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),          # long base64: keys, tokens
+    (r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{40,}={0,2}"
+     r"(?![\w/+=])", "<redacted blob>"),  # long base64 (keys, tokens): mixed case and digits, so not hashes or paths
 ]
 _REDACT = [(re.compile(p, re.S), r) for p, r in REDACT]
 STOPWORDS = set("""a an and are as at be but by can could did do does doing for from had has have how i if in into is
