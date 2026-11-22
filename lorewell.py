@@ -2548,12 +2548,49 @@ LOOKUPS = {"info": cmd_info, "cheatsheet": cmd_cheatsheet, "toc": cmd_toc, "sear
            "note": cmd_note, "notes": cmd_notes}
 
 
+class HelpFormat(argparse.RawDescriptionHelpFormatter):
+    """--help laid out the way hobkin, lorewell, eaveswatch, atone and hearthboard all do it: a short usage line,
+    then each command and option on one line with what it does (argparse's {a,b,c} list of choices left out)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=26, width=min(100, shutil.get_terminal_size((100, 24)).columns))
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(self._format_action(a) for a in action._get_subactions())
+        return super()._format_action(action)
+
+    @classmethod
+    def everywhere(cls, parser, prog=None):
+        """This layout for a parser and all its commands, at every level: commands shown as COMMAND, and listed
+        under "commands" (or "arguments", where there are others too)."""
+        parser.formatter_class = cls
+        subs = [a for a in parser._positionals._group_actions if isinstance(a, argparse._SubParsersAction)]
+        for action in subs:
+            action.metavar = action.metavar or "COMMAND"
+            for each in action.choices.values():
+                cls.everywhere(each)
+        if subs:
+            parser._positionals.title = "commands" if len(subs) == len(parser._positionals._group_actions) else "arguments"
+        return parser
+
+
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="lorewell" if Path(sys.argv[0]).name != "lore.py" else "lore.py",
-                                 description="Reference packs (lores) for languages and their tools.")
-    ap.add_argument("--version", action="version", version=f"lorewell {__version__}")
+    prog = "lorewell" if Path(sys.argv[0]).name != "lore.py" else "lore.py"
+    ap = argparse.ArgumentParser(
+        prog=prog, usage=f"{prog} COMMAND [options]",
+        description="lorewell: reference packs (lores) for languages and their tools, one SQLite file each: ranked\n"
+                    "search, symbols, checked examples and tool docs, installed as a skill any agent reads. And\n"
+                    "living lores, which agents write as they learn (hobkin's field lore is one).",
+        epilog="examples:\n"
+               f"  {prog} install jq.lore.db                    a lore, as a skill for the agent here\n"
+               f"  {prog} --lore jq.lore.db search 'select by key'  ranked hits\n"
+               f"  {prog} build mytool docs/ --base-url URL --model M\n"
+               f"  {prog} living field.lore.db topics           what a living lore holds\n\n"
+               f"{prog} COMMAND --help: that command's options. More: https://github.com/frank-lynam/lorewell")
+    ap.add_argument("--version", action="version", version=f"lorewell {__version__}", help="show the version and exit")
     ap.add_argument("--lore", help="the .lore.db to read (default: $LORE, or the one beside lore.py)")
-    sub = ap.add_subparsers(dest="cmd")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", prog=prog)
     c = sub.add_parser("compile", help="compile a pack source folder into a lore")
     c.add_argument("src")
     c.add_argument("-o", "--out", help="where to write it (default: NAME.lore.db here)")
@@ -2678,7 +2715,7 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument("days", type=float, nargs="?", default=90)
     x = lsub.add_parser("merge", help="bring another living lore in (newest wins, nothing lost)")
     x.add_argument("other")
-    return ap
+    return HelpFormat.everywhere(ap)
 
 
 def cmd_ws(args) -> int:
