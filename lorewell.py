@@ -49,7 +49,7 @@ Standard library only; Python 3.9+. See README.md for the pack source format.
 
 from __future__ import annotations
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 import argparse
 import base64
