@@ -4,6 +4,7 @@ a reviewer's decisions; the review page reads and writes the pack source."""
 
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -219,6 +220,109 @@ class BuildTest(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+
+
+def big_doc(n: int) -> str:
+    """A Markdown reference with `n` chunks' worth of functions, each documented in a sentence of its own."""
+    parts = []
+    for i in range(n):
+        parts.append(f"## Part {i}\n\nThe functions of part {i}.\n")
+        for j in range(40):
+            parts.append(f"### fn{i}x{j}(s)\n\nReturns the string s, turned by rule number {i}-{j} of part {i} "
+                         f"into something else entirely, every time without fail.\n" + "Words. " * 30 + "\n")
+    return "\n".join(parts)
+
+
+class ResilienceTest(unittest.TestCase):
+    """A build carries on where it stopped: on another model or API, after credits ran out, through a flaky
+    gateway; too-long passages are split; a passage that keeps failing is listed, and stops the build unless
+    gaps are allowed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "ref.md").write_text(big_doc(4))
+        self.out = self.tmp / "packs" / "big"
+        self.fakes = []
+
+    def tearDown(self):
+        for f in self.fakes:
+            f.close()
+        shutil.rmtree(self.tmp)
+
+    def fake(self, fault=None):
+        f = FakeModel(fault)
+        self.fakes.append(f)
+        return f
+
+    def model(self, fake, name="fake", api="openai", **kw):
+        m = hl.Model(fake.url, name, None, self.out / ".build" / "answers", api=api, **kw)
+        m.backoff = 0.01
+        return m
+
+    def build(self, model, **kw):
+        return hl.build("big", [str(self.tmp / "ref.md")], [], self.out, model, log=lambda *_: None, **kw)
+
+    def distills(self, fake):
+        return sum(1 for b in fake.requests if "Passage:" in json.dumps(b))
+
+    def test_out_of_credits_stops_then_another_model_and_api_carries_on(self):
+        broke = self.fake(lambda body, n: (402, b'{"error": "Insufficient credits"}') if n > 2 else None)
+        with self.assertRaises(hl.ModelStopped) as e:
+            self.build(self.model(broke), jobs=1)
+        self.assertIn("out of credits", str(e.exception))
+        self.assertIn("run the same command again to carry on", str(e.exception))
+        self.assertEqual(self.distills(broke), 3)                 # it stopped asking: no fourth question
+        chunks = len(json.loads((self.out / ".build" / "chunks.json").read_text()))
+        self.assertGreater(chunks, 3)
+        other = self.fake()                                       # another model, Anthropic-format
+        r = self.build(self.model(other, "other-model", api="anthropic"))
+        self.assertEqual(self.distills(other), chunks - 2)        # only what wasn't answered yet
+        self.assertTrue(all("system" in b for b in other.requests))
+        self.assertGreater(r["symbols"], 100)
+        saved = [json.loads(f.read_text())["model"] for f in (self.out / ".build" / "answers").glob("distill-*")]
+        self.assertEqual(sorted(set(saved)), ["fake", "other-model"])   # each answer says which model gave it
+
+    def test_a_flaky_gateway_is_waited_out(self):
+        def flaky(body, n):
+            return {1: (503, b"upstream down"), 2: (200, b"<html>Bad gateway</html>"), 3: (429, b"slow down"),
+                    4: (200, b'{"choices": [{"message": {"content": ""}}]}'), 5: (504, b"timeout")}.get(n)
+        f = self.fake(flaky)
+        r = self.build(self.model(f), jobs=1)
+        self.assertGreater(r["symbols"], 100)
+        self.assertEqual(r["gaps"], 0)
+
+    def test_still_down_after_the_patience_stops_the_run(self):
+        f = self.fake(lambda body, n: (502, b"bad gateway"))
+        with self.assertRaises(hl.ModelStopped) as e:
+            self.build(self.model(f, patience=0.3), jobs=2)
+        self.assertIn("still failing", str(e.exception))
+
+    def test_too_long_passages_are_split(self):
+        f = self.fake(lambda body, n: (400, b'{"error": "maximum context length exceeded"}')
+                      if len(json.dumps(body)) > 9000 else None)
+        r = self.build(self.model(f))
+        self.assertGreater(r["symbols"], 100)
+        self.assertEqual(r["gaps"], 0)
+
+    def test_a_passage_that_keeps_failing_stops_the_build_unless_gaps_are_allowed(self):
+        bad = lambda body, n: (200, json.dumps({"choices": [{"message": {"content": "no json here"}}]}).encode()) \
+            if "Part 1" in json.dumps(body) and "Passage:" in json.dumps(body) else None
+        with self.assertRaises(hl.LoreError) as e:
+            self.build(self.model(self.fake(bad)))
+        self.assertIn("--allow-gaps", str(e.exception))
+        failed = json.loads((self.out / ".build" / "failed.json").read_text())
+        self.assertTrue(failed and "wasn't JSON" in failed[0]["error"])
+        r = self.build(self.model(self.fake(bad)), allow_gaps=True)
+        self.assertEqual(r["gaps"], len(failed))
+        names = re.findall(r'"name": "(fn\\d+x\\d+)"', (self.out / "symbols.jsonl").read_text())
+        self.assertLess(len(set(names)), 4 * 40)                  # the failed chunk's functions are missing
+
+    def test_a_refused_key_stops_at_once(self):
+        f = self.fake(lambda body, n: (401, b"bad key"))
+        with self.assertRaises(hl.ModelStopped) as e:
+            self.build(self.model(f), jobs=3)
+        self.assertIn("refused the key", str(e.exception))
+        self.assertLessEqual(len(f.requests), 3)                   # the ones already asked, and no more
 
 if __name__ == "__main__":
     unittest.main()

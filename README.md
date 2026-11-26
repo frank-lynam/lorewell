@@ -151,7 +151,8 @@ Hand-writing a pack is fine for a small language; a real one (PeopleCode, a vend
 pages. `lorewell build` has a model write the pack source from the documentation itself:
 
 ```sh
-export LORE_API_KEY=...            # any OpenAI-format endpoint: OpenRouter, a gateway, Ollama, vLLM...
+export LORE_API_KEY=...            # any OpenAI-format endpoint (OpenRouter, a gateway, Ollama, vLLM...),
+                                   # or Anthropic-format with --api anthropic
 lorewell build jq https://jqlang.org/manual/v1.7/ --tool jq --version 1.7 \
     --check 'jq -c -f {file}' --check-ext .jq --check-compare json \
     --base-url https://openrouter.ai/api/v1 --model nvidia/nemotron-3-ultra-550b-a55b
@@ -179,8 +180,23 @@ lorewell compile packs/jq         # then compile and install as usual
    symbols its code really uses.
 5. **Finish.** The model writes the description, the cheatsheet and the skill text from the merged entries.
 
-Every model answer is recorded in `.build/answers/`, keyed by the prompt and model: a rebuild asks again only
-about what changed. What people did outlives a rebuild: entries written by hand, and entries accepted, edited or
+Every model answer is saved in `.build/answers/` as it comes, keyed by the question alone (each one notes which
+model answered it): a rebuild asks again only about what changed, and `--redo` asks everything again.
+
+**A build that stops carries on.** Run the same command again and it picks up where it was, on the same model or
+another, even at another API (`--base-url`, `--model`, `--api openai|anthropic`). URL sources are kept after the
+first fetch (`--refetch` to fetch them again).
+
+- **A flaky endpoint is waited out:** timeouts, dropped connections, 5xx, rate limits (as long as a `Retry-After`
+  asks) and replies that aren't an answer (a gateway's HTML error page, an empty or broken body) are retried, for up
+  to `--patience` minutes per question (default 10).
+- **A refused key, no credits, a used-up quota, an unknown model,** or an endpoint still down when the patience
+  runs out, stop the build: nothing new is asked, the questions already out finish and are saved, and it says to
+  run it again.
+- **A passage too long for the model's context** is asked again in halves.
+- **A passage that fails on its own** (an answer that's never JSON, a request the API rejects) is listed in
+  `.build/failed.json`, and the build stops before writing a pack with a hole in it; run it again to retry them, or
+  `--allow-gaps` to build without them. What people did outlives a rebuild: entries written by hand, and entries accepted, edited or
 rejected in review, stay as they are, and a hand-edited cheatsheet or skill text is kept. So a build can also
 extend a hand-written pack. `--limit N` tries a build on the first
 N chunks. With `--check`, `compile` runs the examples; `--check-compare json` compares their output as JSON

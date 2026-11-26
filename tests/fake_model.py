@@ -46,8 +46,13 @@ def answer(system: str, user: str) -> dict:
 
 
 class FakeModel:
-    def __init__(self):
+    """`fault(body, n)` (n counts requests from 1) may return (status, body bytes) to answer with instead, for
+    outages, garbage and running out of credits. It answers OpenAI-format at /v1/chat/completions and
+    Anthropic-format at /v1/messages."""
+
+    def __init__(self, fault=None):
         self.requests = []
+        self.fault = fault
         fm = self
 
         class H(BaseHTTPRequestHandler):
@@ -57,10 +62,16 @@ class FakeModel:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fm.requests.append(body)
-                msgs = body["messages"]
-                content = json.dumps(answer(msgs[0]["content"], msgs[-1]["content"]))
-                raw = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
-                self.send_response(200)
+                code, raw = (fm.fault(body, len(fm.requests)) if fm.fault else None) or (200, None)
+                if raw is None:
+                    msgs = body["messages"]
+                    if self.path.endswith("/messages"):        # Anthropic-format: the system prompt on its own
+                        content = json.dumps(answer(body["system"], msgs[-1]["content"]))
+                        raw = json.dumps({"content": [{"type": "text", "text": content}]}).encode()
+                    else:
+                        content = json.dumps(answer(msgs[0]["content"], msgs[-1]["content"]))
+                        raw = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
+                self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()

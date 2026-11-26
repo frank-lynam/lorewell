@@ -31,11 +31,13 @@ with --lore FILE or $LORE):
     note TEXT [--on REF]    keep something learned the hard way (kept apart from the lore; survives rebuilds)
     notes [QUERY]           what's been noted
 
-Building a pack source from documentation (with any OpenAI-format model), and reviewing it:
-    lorewell build NAME [DOCS...] [--tool CMD]... --base-url URL --model M [--check CMD]
+Building a pack source from documentation (with any OpenAI- or Anthropic-format model), and reviewing it:
+    lorewell build NAME [DOCS...] [--tool CMD]... --base-url URL --model M [--api anthropic] [--check CMD]
                                                 PDF, HTML, Markdown, folders, URLs, tools' --help and man
                                                 pages -> packs/NAME, every entry citing the source lines it
-                                                rests on; model answers recorded, so rebuilds are cheap
+                                                rests on; answers saved as they come, so a build that
+                                                stops (no credits, a flaky gateway) carries on when run
+                                                again, on the same model or another
     lorewell review DIR                      a local page: each entry beside its source; accept, edit, reject
 
 Code that lives in a database (a lore whose tools can pull and deploy it), worked from a git repo:
@@ -49,13 +51,14 @@ Standard library only; Python 3.9+. See README.md for the pack source format.
 
 from __future__ import annotations
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 import argparse
 import base64
 import difflib
 import hashlib
 import html.parser
+import http.client
 import json
 import os
 import re
@@ -1354,7 +1357,7 @@ def slug(text: str, n: int = 48) -> str:
 
 
 def gather(sources: list[str], tools: list[str], work: Path, log=print, model: Model | None = None,
-           help_limit: int = HELP_LIMIT) -> list[dict]:
+           help_limit: int = HELP_LIMIT, refetch: bool = False) -> list[dict]:
     """Every source as text in work/sources/, listed in work/sources.json: files (PDF, HTML, Markdown, text,
     scripts), folders of them, URLs, and for each tool its help (its subcommands' too, found with the model) and
     man page."""
@@ -1387,10 +1390,16 @@ def gather(sources: list[str], tools: list[str], work: Path, log=print, model: M
                  + path.read_text(encoding="utf-8", errors="replace") + "\n```\n")
 
     for src in sources:
-        if re.match(r"https?://", src):
-            req = urllib.request.Request(src, headers={"User-Agent": f"lorewell/{__version__}"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+        if re.match(r"https?://", src):           # fetched once and kept, so a build run again doesn't refetch
+            saved = work / "fetched" / (hashlib.sha256(src.encode()).hexdigest()[:24] + ".txt")
+            if saved.exists() and not refetch:
+                raw = saved.read_text(encoding="utf-8")
+            else:
+                req = urllib.request.Request(src, headers={"User-Agent": f"lorewell/{__version__}"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    raw = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                saved.write_text(raw, encoding="utf-8")
             keep(src, "html" if "<html" in raw[:2000].lower() else "text",
                  html_text(raw) if "<html" in raw[:2000].lower() else raw)
             continue
@@ -1439,54 +1448,126 @@ def chunk(text: str, size: int = CHUNK_CHARS) -> list[tuple[int, int, str]]:
     return [c for c in out if c[2].strip()]
 
 
-class Model:
-    """An OpenAI-format chat endpoint (OpenRouter, a gateway, Ollama, vLLM...), over urllib. Every answer is
-    recorded in `answers` keyed by (task, prompt, model): a rebuild asks again only what changed."""
+class ModelStopped(LoreError):
+    """The model can't be asked anything more this run (a refused key, no credits left, no such model, or still
+    unreachable after the patience ran out). Everything answered so far is saved, so running the same command
+    again carries on from there, on this model or another."""
 
-    def __init__(self, base_url: str, model: str, key: str | None, answers: Path, timeout: float = 300):
-        self.url = base_url.rstrip("/") + "/chat/completions"
-        self.model, self.key, self.answers, self.timeout = model, key, answers, timeout
+
+class TooLong(LoreError):
+    """This one request is too long for the model's context window: the caller splits it."""
+
+
+RESUME = ("everything answered so far is saved: run the same command again to carry on (another --base-url, "
+          "--model or --api is fine)")
+
+
+class Model:
+    """A chat endpoint over urllib: OpenAI-format (OpenRouter, a gateway, Ollama, vLLM...) or Anthropic-format
+    (`api="anthropic"`: Anthropic's API, or a gateway passing it through). Every answer is saved in `answers`,
+    keyed by the question alone (task and prompt) and recording which model gave it: a build that stops (credits
+    run out, the gateway falls over) carries on where it was when run again, on the same model or any other.
+
+    A flaky endpoint is waited out: timeouts, dropped connections, 5xx, rate limits and replies that aren't
+    what an API sends (an HTML error page, an empty or broken body) are retried, for up to `patience` seconds
+    per question, as long as a Retry-After asks. A refused key, no credits, a used-up quota or an unknown model
+    stop the run (ModelStopped): no new questions are asked, and the ones already asked finish and are saved."""
+
+    def __init__(self, base_url: str, model: str, key: str | None, answers: Path, timeout: float = 300,
+                 api: str = "openai", patience: float = 600, redo: bool = False):
+        if api not in ("openai", "anthropic"):
+            raise LoreError("--api is openai or anthropic")
+        base = base_url.rstrip("/")
+        self.url = (re.sub(r"/v1$", "", base) + "/v1/messages") if api == "anthropic" else base + "/chat/completions"
+        self.api, self.model, self.key, self.answers, self.timeout = api, model, key, answers, timeout
+        self.patience, self.redo = patience, redo
+        self.backoff = 3.0                         # seconds before the first retry; doubling, at most a minute
         self.answers.mkdir(parents=True, exist_ok=True)
         self.calls = 0
         self.json_mode = True
+        self.stopped: str | None = None            # why no more questions are asked this run
+        self.lock = threading.Lock()
 
-    def _post(self, messages: list[dict]) -> str:
-        body = {"model": self.model, "messages": messages}
-        if self.json_mode:
-            body["response_format"] = {"type": "json_object"}
-        req = urllib.request.Request(self.url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json",
-                                              **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
-        for attempt in range(5):
+    def stop(self, why: str):
+        with self.lock:
+            self.stopped = self.stopped or why
+        raise ModelStopped(f"{self.stopped}; {RESUME}")
+
+    def _request(self, system: str, messages: list[dict]) -> urllib.request.Request:
+        if self.api == "anthropic":
+            body = {"model": self.model, "max_tokens": 16000, "system": system, "messages": messages}
+            headers = {"anthropic-version": "2023-06-01", **({"x-api-key": self.key} if self.key else {})}
+        else:
+            body = {"model": self.model, "messages": [{"role": "system", "content": system}] + messages}
+            if self.json_mode:
+                body["response_format"] = {"type": "json_object"}
+            headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
+        return urllib.request.Request(self.url, data=json.dumps(body).encode(), method="POST",
+                                      headers={"Content-Type": "application/json", **headers})
+
+    def _text(self, data) -> str:
+        """The reply's text, or ValueError when the body isn't an answer (a gateway's garbage: retried)."""
+        if self.api == "anthropic":
+            text = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
+        else:
+            text = data["choices"][0]["message"]["content"] or ""
+        if not text.strip():
+            raise ValueError("an empty reply")
+        return text
+
+    def _post(self, system: str, messages: list[dict]) -> str:
+        deadline, attempt, last = time.time() + self.patience, 0, ""
+        while True:
+            if self.stopped:
+                raise ModelStopped(f"{self.stopped}; {RESUME}")
+            wait = None
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    data = json.loads(r.read())
-                self.calls += 1
-                return data["choices"][0]["message"]["content"] or ""
+                with urllib.request.urlopen(self._request(system, messages), timeout=self.timeout) as r:
+                    raw = r.read()
+                try:
+                    text = self._text(json.loads(raw))
+                    with self.lock:
+                        self.calls += 1
+                    return text
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+                    last = f"a reply that isn't an answer ({str(e)[:80] or type(e).__name__}): {raw[:120]!r}"
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:300]
-                if e.code == 400 and self.json_mode and "response_format" in detail:
-                    self.json_mode = False          # this endpoint has no JSON mode: the prompt asks for JSON
-                    return self._post(messages)
-                if e.code in (408, 429, 500, 502, 503, 504) and attempt < 4:
-                    time.sleep(min(60, 2 ** attempt * 3))
+                low = detail.lower()
+                if e.code == 400 and self.api == "openai" and self.json_mode and "response_format" in low:
+                    self.json_mode = False              # this endpoint has no JSON mode: the prompt asks for JSON
                     continue
-                raise LoreError(f"model call failed: HTTP {e.code}: {detail}") from None
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-                if attempt < 4:
-                    time.sleep(min(60, 2 ** attempt * 3))
-                    continue
-                raise LoreError(f"model call failed: {e}") from None
-        raise LoreError("model call failed")
+                if e.code in (400, 413) and re.search(r"context|too long|too many tokens|maximum.*tokens|prompt is too", low):
+                    raise TooLong(f"too long for the model: HTTP {e.code}: {detail[:200]}") from None
+                if e.code in (401, 403):
+                    self.stop(f"{self.url} refused the key (HTTP {e.code}: {detail[:150]})")
+                if e.code == 402 or (e.code == 429 and re.search(r"quota|credit|billing|insufficient|balance", low)):
+                    self.stop(f"out of credits or quota at {self.url} (HTTP {e.code}: {detail[:150]})")
+                if e.code == 404:
+                    self.stop(f"{self.url} doesn't know model {self.model!r} (HTTP 404: {detail[:150]})")
+                if e.code not in (408, 409, 425, 429) and e.code < 500:
+                    raise LoreError(f"model call failed: HTTP {e.code}: {detail}") from None   # this question only
+                last = f"HTTP {e.code}: {detail[:150]}"
+                ra = e.headers.get("Retry-After") if e.headers else None
+                if ra and ra.strip().isdigit():
+                    wait = float(ra)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+                last = str(getattr(e, "reason", e))[:150]
+            attempt += 1
+            wait = min(wait if wait is not None else min(60.0, self.backoff * 2 ** min(attempt - 1, 5)),
+                       max(0.0, deadline - time.time()))
+            if time.time() + wait >= deadline:
+                self.stop(f"{self.url} still failing after {round(self.patience / 60, 1)} min of retries ({last})")
+            time.sleep(wait)
 
     def ask(self, task: str, system: str, user: str) -> dict:
-        key = hashlib.sha256(json.dumps([task, system, user, self.model]).encode()).hexdigest()[:24]
+        key = hashlib.sha256(json.dumps([task, system, user]).encode()).hexdigest()[:24]
         f = self.answers / f"{task}-{key}.json"
-        if f.exists():
+        if f.exists() and not self.redo:
             return json.loads(f.read_text(encoding="utf-8"))["output"]
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        messages = [{"role": "user", "content": user}]
         for _ in range(2):
-            raw = self._post(messages)
+            raw = self._post(system, messages)
             m = re.search(r"\{.*\}", raw, re.S)
             try:
                 out = json.loads(m.group(0) if m else raw)
@@ -1500,8 +1581,8 @@ class Model:
                                                      "Reply again with only the JSON object."}]
         else:
             raise LoreError(f"{task}: the model's answer wasn't JSON")
-        tmp = f.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"task": task, "model": self.model, "key": key, "at": time.strftime(
+        tmp = f.with_suffix(f".{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps({"task": task, "model": self.model, "api": self.api, "key": key, "at": time.strftime(
             "%Y-%m-%d %H:%M:%S"), "output": out}, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, f)
         return out
@@ -1587,9 +1668,12 @@ def locate(quote: str, chunk_text: str, first_line: int) -> tuple[int, int] | No
 
 
 def distill_all(model: Model, srcs: list[dict], work: Path, language: str, jobs: int, limit: int | None,
-                log=print) -> list[dict]:
+                log=print, allow_gaps: bool = False) -> list[dict]:
     """[chunk] and [distill]: every chunk of every source through the model (in parallel). Returns the raw entries,
-    each with its chunk."""
+    each with its chunk. A chunk too long for the model is asked again in halves. A chunk that fails on its own
+    (an answer that never comes back as JSON, a request the API rejects) is left out and listed in
+    failed.json; unless `allow_gaps`, the build stops there, so a pack never quietly has holes. If the model
+    stops altogether (ModelStopped), what's in flight finishes and the build stops: run it again to carry on."""
     chunks = []
     for s in srcs:
         text = (work / "sources" / f"{s['id']}.txt").read_text(encoding="utf-8")
@@ -1600,25 +1684,55 @@ def distill_all(model: Model, srcs: list[dict], work: Path, language: str, jobs:
     (work / "chunks.json").write_text(json.dumps([{k: c[k] for k in ("id", "first", "last")} | {
         "source": c["source"]["id"], "name": c["source"]["name"]} for c in chunks], indent=1), encoding="utf-8")
     log(f"distilling {len(chunks)} chunks ({jobs} at a time)...")
-    done = [0]
+    done, failed = [0], []
 
-    def one(c):
+    def ask(c, depth=0):
+        """[(chunk, answer)] for a chunk: itself, or its halves (and theirs) when it's too long for the model."""
         user = (f"Language: {language}\nSource: {c['source']['name']}, lines {c['first']}-{c['last']}\n\n"
                 f"Passage:\n{c['text']}")
-        out = model.ask("distill", DISTILL_SYSTEM, user)
-        done[0] += 1
-        if done[0] % 10 == 0 or done[0] == len(chunks):
-            log(f"  {done[0]}/{len(chunks)}")
-        return c, out
+        try:
+            return [(c, model.ask("distill", DISTILL_SYSTEM, user))]
+        except TooLong:
+            lines = c["text"].splitlines()
+            if depth >= 4 or len(lines) < 2:
+                raise
+            mid = len(lines) // 2
+            halves = [{**c, "id": f"{c['source']['id']}:{f}-{l}", "first": f, "last": l, "text": "\n".join(part)}
+                      for f, l, part in ((c["first"], c["first"] + mid - 1, lines[:mid]),
+                                         (c["first"] + mid, c["last"], lines[mid:]))]
+            return ask(halves[0], depth + 1) + ask(halves[1], depth + 1)
+
+    def one(c):
+        try:
+            return ask(c)
+        except ModelStopped:
+            return None
+        except LoreError as e:
+            failed.append({"chunk": c["id"], "source": c["source"]["name"], "error": str(e)[:300]})
+            return []
+        finally:
+            done[0] += 1
+            if done[0] % 10 == 0 or done[0] == len(chunks):
+                log(f"  {done[0]}/{len(chunks)}")
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max(1, jobs)) as ex:
         results = list(ex.map(one, chunks))
+    left = sum(1 for r in results if r is None)
+    (work / "failed.json").write_text(json.dumps(failed, indent=1), encoding="utf-8")
+    if model.stopped:
+        raise ModelStopped(f"stopped with {len(chunks) - left} of {len(chunks)} chunks read: {model.stopped}; {RESUME}")
+    if failed and not allow_gaps:
+        raise LoreError(f"{len(failed)} of {len(chunks)} chunks failed (each, and why: {work / 'failed.json'}). "
+                        f"Run again to retry them (another --model is fine), or add --allow-gaps to build without them")
+    if failed:
+        log(f"  {len(failed)} chunks left out (--allow-gaps): listed in {work / 'failed.json'}")
     entries = []
-    for c, out in results:
-        for kind in ("sections", "symbols", "examples", "tools"):
-            for e in out.get(kind) or []:
-                if isinstance(e, dict):
-                    entries.append({"kind": kind, "entry": e, "chunk": c})
+    for pairs in results:
+        for c, out in pairs or []:
+            for kind in ("sections", "symbols", "examples", "tools"):
+                for e in out.get(kind) or []:
+                    if isinstance(e, dict):
+                        entries.append({"kind": kind, "entry": e, "chunk": c})
     return entries
 
 
@@ -1802,22 +1916,29 @@ def draft_operations(model: Model, language: str, packs: dict, log=print) -> dic
 
 def build(name: str, sources: list[str], tools: list[str], out: Path, model: Model, title: str | None = None,
           language: str | None = None, version: str | None = None, check: dict | None = None, jobs: int = 4,
-          limit: int | None = None, log=print, help_limit: int = HELP_LIMIT) -> dict:
+          limit: int | None = None, log=print, help_limit: int = HELP_LIMIT, allow_gaps: bool = False,
+          refetch: bool = False) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name):
         raise LoreError("the name: lowercase letters, digits and hyphens (it names the skill)")
     work = out / ".build"
     title, language = title or name, language or title or name
     log("gathering sources...")
-    srcs = gather(sources, tools, work, log, model, help_limit)
+    srcs = gather(sources, tools, work, log, model, help_limit, refetch)
     if not srcs:
         raise LoreError("no text in any of the sources")
-    entries = distill_all(model, srcs, work, language, jobs, limit, log)
+    entries = distill_all(model, srcs, work, language, jobs, limit, log, allow_gaps)
     packs = verify_and_merge(entries)
-    names = "\n".join(f"- {y['name']} ({y['kind']}): {y.get('summary') or ''}" for y in packs["symbols"][:400])
     tool_lines = "\n".join(f"- {t['name']}: {t.get('purpose') or ''}" for t in packs["tools"])
-    heads = "\n".join(f"- {s['title']}" for s in packs["sections"][:200])
-    fin = model.ask("finish", FINISH_SYSTEM, f"Language: {language}\n\nSections:\n{heads}\n\nSymbols:\n{names}"
-                                             f"\n\nTools:\n{tool_lines or '(none documented)'}")
+    for cap in (400, 150, 50):                  # fewer names if the list is too long for the model
+        names = "\n".join(f"- {y['name']} ({y['kind']}): {y.get('summary') or ''}" for y in packs["symbols"][:cap])
+        heads = "\n".join(f"- {s['title']}" for s in packs["sections"][:cap // 2])
+        try:
+            fin = model.ask("finish", FINISH_SYSTEM, f"Language: {language}\n\nSections:\n{heads}\n\nSymbols:\n"
+                                                     f"{names}\n\nTools:\n{tool_lines[:20000] or '(none documented)'}")
+            break
+        except TooLong:
+            if cap == 50:
+                raise
     ops = {}
     if packs["tools"]:
         ops = draft_operations(model, language, packs, log)
@@ -1829,7 +1950,8 @@ def build(name: str, sources: list[str], tools: list[str], out: Path, model: Mod
     write_pack(out, pack, packs, str(fin.get("cheatsheet") or ""), str(fin.get("skill") or ""), log, ops)
     flagged = sum(1 for rows in packs.values() for r in rows if (r.get("review") or {}).get("flags"))
     return {"out": str(out), "sources": len(srcs), "chunks": len(json.loads((work / "chunks.json").read_text())),
-            **{k: len(v) for k, v in packs.items()}, "flagged": flagged, "model_calls": model.calls}
+            **{k: len(v) for k, v in packs.items()}, "flagged": flagged, "model_calls": model.calls,
+            "gaps": len(json.loads((work / "failed.json").read_text()))}
 
 
 # ---- review: a local web page to review a built pack source, entry by entry, beside the source it cites
@@ -2636,7 +2758,9 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--check-compare", choices=["exact", "words", "json"], default="exact",
                    help="how an example's output is compared with its expected output (json: as JSON values)")
     b.add_argument("--base-url", default=os.environ.get("LORE_BASE_URL"),
-                   help="an OpenAI-format endpoint (default: $LORE_BASE_URL), e.g. https://openrouter.ai/api/v1")
+                   help="the endpoint (default: $LORE_BASE_URL), e.g. https://openrouter.ai/api/v1")
+    b.add_argument("--api", choices=["openai", "anthropic"], default=os.environ.get("LORE_API", "openai"),
+                   help="the endpoint's format (default: $LORE_API, else openai)")
     b.add_argument("--model", default=os.environ.get("LORE_MODEL"), help="the model (default: $LORE_MODEL)")
     b.add_argument("--key-env", default="LORE_API_KEY", help="the variable holding the API key (default: "
                    "LORE_API_KEY; none needed for a local endpoint)")
@@ -2644,6 +2768,12 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--help-limit", type=int, default=HELP_LIMIT,
                    help=f"help pages read per tool, subcommands included (default {HELP_LIMIT})")
     b.add_argument("--limit", type=int, help="only the first N chunks (to try a build cheaply)")
+    b.add_argument("--patience", type=float, default=10, metavar="MIN",
+                   help="how long to keep retrying a flaky endpoint, per question (default 10 minutes)")
+    b.add_argument("--allow-gaps", action="store_true",
+                   help="build even if some chunks failed (they're listed in .build/failed.json)")
+    b.add_argument("--redo", action="store_true", help="ask every question again, not reusing saved answers")
+    b.add_argument("--refetch", action="store_true", help="fetch URL sources again (they're kept after the first time)")
     r = sub.add_parser("review", help="review a built pack source in the browser")
     r.add_argument("src", help="the pack source folder")
     r.add_argument("--port", type=int, default=8765)
@@ -2795,15 +2925,18 @@ def main(argv: list[str] | None = None) -> int:
             if not args.sources and not args.tool:
                 raise LoreError("build from what? give documentation (files, folders, URLs) and/or --tool CMD")
             out = Path(args.out or f"packs/{args.name}")
-            model = Model(args.base_url, args.model, os.environ.get(args.key_env), out / ".build" / "answers")
+            model = Model(args.base_url, args.model, os.environ.get(args.key_env), out / ".build" / "answers",
+                          api=args.api, patience=args.patience * 60, redo=args.redo)
             check = {"command": args.check, "ext": args.check_ext,
                      "compare": args.check_compare} if args.check else None
             r = build(args.name, args.sources, args.tool, out, model, args.title, args.language, args.lang_version,
-                      check, args.jobs, args.limit, help_limit=args.help_limit)
+                      check, args.jobs, args.limit, help_limit=args.help_limit, allow_gaps=args.allow_gaps,
+                      refetch=args.refetch)
             print(f"{r['out']}: {r['sources']} sources, {r['chunks']} chunks -> {r['sections']} sections, "
                   f"{r['symbols']} symbols, {r['examples']} examples, {r['tools']} tools; {r['flagged']} flagged "
                   f"for review; {r['model_calls']} model calls (the rest were recorded)"
-                  f"\n  next: lorewell review {r['out']}   then: lorewell compile {r['out']}")
+                  + (f"; {r['gaps']} chunks left out (.build/failed.json)" if r["gaps"] else "")
+                  + f"\n  next: lorewell review {r['out']}   then: lorewell compile {r['out']}")
             return 0
         if args.cmd == "review":
             srv = review_server(Path(args.src), args.host, args.port)
